@@ -1,0 +1,834 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation template for a financial budgeting and savings application for lower-income families
+
+Parameters:
+  Cidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: Enter the CIDR block for the VPC
+
+  FrontendAV:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone for Frontend subnet 1
+
+  FrontendAV2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone for Frontend subnet 2
+
+  FrontendSubnetCidr:
+    Type: String
+    Description: CIDR Block for Frontend subnet 1
+    Default: "10.0.1.0/24"
+
+  FrontendSubnetCidr2:
+    Type: String
+    Description: CIDR Block for Frontend subnet 2
+    Default: "10.0.2.0/24"
+
+  PublicAV:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone for Public subnet
+
+  PublicSubnetCidr:
+    Type: String
+    Description: CIDR Block for Public subnet
+    Default: "10.0.6.0/24"
+
+  RepoName:
+    Type: String
+    Description: Enter repository name
+
+  MasterUsername:
+    Type: String
+    Description: "Master username for the RDS instance"
+    NoEcho: true
+
+  MasterUserPassword:
+    Type: String
+    Description: "Master user password for the RDS instance"
+    NoEcho: true
+
+  DBName:
+    Type: String
+    Description: "Name of the database to create"
+    Default: "budgetapp"
+
+  MinCapacity:
+    Type: Number
+    Description: "Minimum ACU capacity for Aurora Serverless v2"
+    Default: 0
+    MaxValue: 128
+
+  MaxCapacity:
+    Type: Number
+    Description: "Maximum ACU capacity for Aurora Serverless v2"
+    Default: 1
+    MinValue: 0.5
+    MaxValue: 128
+
+  EnableMultiAZ:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Enable multi-AZ deployment"
+
+Conditions:
+  CreateMultiAZ: !Equals [!Ref EnableMultiAZ, "true"]
+
+Resources:
+  #VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref Cidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-vpc
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref FrontendAV
+      CidrBlock: !Ref FrontendSubnetCidr
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-subnet-1
+
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref FrontendAV2
+      CidrBlock: !Ref FrontendSubnetCidr2
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-subnet-2
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref PublicAV
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-public-subnet
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-internet-gateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # NAT Config
+  NatInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      GroupSet:
+        - !GetAtt NatSecurityGroup.GroupId
+      SourceDestCheck: false
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-nat-interface
+
+  NatAsgInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref NatRole
+    DependsOn:
+      - NatRole
+
+  NatLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: NatLaunchTemplate
+      VersionDescription: Initial version
+      LaunchTemplateData:
+        ImageId: ami-0328a21a503f457f0
+        InstanceType: t2.micro
+        IamInstanceProfile:
+          Name: !Ref NatAsgInstanceProfile
+        SecurityGroupIds:
+          - !GetAtt NatSecurityGroup.GroupId
+        UserData:
+          Fn::Base64:
+            Fn::Join:
+              - ""
+              - - |-
+                  #!/bin/bash
+                  echo "eni_id=
+                - !Ref NatInterface
+                - |-
+                  " >> /etc/fck-nat.conf
+                  service fck-nat restart
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: budgetapp-prod-nat-launch-template
+    DependsOn:
+      - NatRole
+      - NatInterface
+
+  NatAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MaxSize: "1"
+      MinSize: "1"
+      DesiredCapacity: "1"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NatLaunchTemplate
+        Version: !GetAtt NatLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-asg
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingScheduledAction:
+        IgnoreUnmodifiedGroupSizeProperties: true
+
+  NatSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for NAT
+      SecurityGroupIngress:
+        - CidrIp: !Ref Cidr
+          IpProtocol: "-1"
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: "-1"
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-nat-sg
+
+  SGAllTrafficFromVPC:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: SGAllTrafficFromVPC
+      GroupDescription: VPN Traffic from VPC CIDR
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: !Ref Cidr
+          Description: All Traffic from VPC CIDR
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-sg-vpc-traffic
+
+  NatRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+        Version: "2012-10-17"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ec2:AttachNetworkInterface
+                  - ec2:ModifyNetworkInterfaceAttribute
+                Effect: Allow
+                Resource: "*"
+            Version: "2012-10-17"
+          PolicyName: attachNatEniPolicy
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ec2:AssociateAddress
+                  - ec2:DisassociateAddress
+                Effect: Allow
+                Resource: "*"
+            Version: "2012-10-17"
+          PolicyName: associateNatAddressPolicy
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-nat-role
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-public-route-table
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-private-route-table
+
+  #Routes
+  RouteInternetGateway:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  RouteNatInstance:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NetworkInterfaceId: !Ref NatInterface
+    DependsOn:
+      - NatInterface
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  #security groups
+  HTTP:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Frontend Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-http-sg
+
+  ECSTaskSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB to ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref HTTP
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-ecstask-sg
+
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: "Security group for Aurora Serverless v2"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-aurora-sg
+
+  #loadbalancer
+  Loadbalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: BudgetAppALB
+      Subnets:
+        - !Ref Subnet
+        - !Ref Subnet2
+      SecurityGroups:
+        - !Ref HTTP
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-loadbalancer
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: BudgetAppTargetGroup
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-target-group
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref Loadbalancer
+      Port: 80
+      Protocol: HTTP
+
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /*
+      ListenerArn: !Ref Listener
+      Priority: 1
+
+  #endpoint
+  APIGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.execute-api"
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref Subnet, !Ref Subnet2]
+      SecurityGroupIds: [!Ref ECSTaskSG]
+      PrivateDnsEnabled: true
+
+  #ECR and ECS config
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepoName
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-ecr
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: BudgetAppCluster
+      # Enable CloudWatch Container Insights for better monitoring
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-ecs-cluster
+
+  # Add ECS Log Group
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/budgetapp
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-ecs-logs
+
+  # Add IAM Role for ECS
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/AmazonRDSDataFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-execution-role
+
+  ConstainerService:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: BudgetAppService
+      Cluster: !Ref ECSCluster
+      DesiredCount: 0
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref Subnet, !Ref Subnet2]
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ECSTaskSG
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroup
+          ContainerName: container
+          ContainerPort: 80
+      # Add deployment configuration for better control over task deployment
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      # Enable health check grace period to allow containers time to start
+      HealthCheckGracePeriodSeconds: 60
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-ecs-service
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ExecutionRoleArn: !Ref Role
+      TaskRoleArn: !Ref Role # Ensure proper permissions for the task
+      Family: budgetapp
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: 512
+      Memory: 1024
+      # Add proper logging configuration
+      ContainerDefinitions:
+        - Name: container
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${RepoName}:latest"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: container
+          Environment:
+            - Name: API_URL
+              Value: !Sub "https://${DataAPI}.execute-api.${AWS::Region}.amazonaws.com/prod"
+            - Name: DB_HOST
+              Value: !GetAtt AuroraCluster.Endpoint.Address
+            - Name: DB_PORT
+              Value: !GetAtt AuroraCluster.Endpoint.Port
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: DB_USER
+              Value: !Ref MasterUsername
+            - Name: DB_PASSWORD
+              Value: !Ref MasterUserPassword
+          # Add health check for the container
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -f http://localhost:80/ || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-task-definition
+
+  # Aurora Serverless v2 Resources
+  AuroraDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: "AuroraDBSubnetGroup"
+      DBSubnetGroupDescription: "Subnet group for Aurora Serverless v2"
+      SubnetIds:
+        - !Ref Subnet
+        - !Ref Subnet2
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-db-subnet-group
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-mysql
+      EngineVersion: "8.0.mysql_aurora.3.08.0"
+      DatabaseName: !Ref DBName
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      DBClusterIdentifier: !Sub "${AWS::StackName}-aurora-cluster"
+      DBSubnetGroupName: !Ref AuroraDBSubnetGroup
+      VpcSecurityGroupIds:
+        - !GetAtt AuroraSecurityGroup.GroupId
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+      EnableHttpEndpoint: true
+      StorageEncrypted: true
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-aurora-cluster
+
+  AuroraPrimaryInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-mysql
+      PromotionTier: 1
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-aurora-primary
+
+  AuroraReaderInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: CreateMultiAZ
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-mysql
+      PromotionTier: 1
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-aurora-reader
+
+  DataProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BudgetAppDataProcessor
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt Role.Arn
+      Code:
+        S3Bucket: shaqkoriaurora
+        S3Key: packag.zip
+      Environment:
+        Variables:
+          DB_NAME: !Ref DBName
+          DB_USER: !Ref MasterUsername
+          DB_PASSWORD: !Ref MasterUserPassword
+          DB_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          DB_PORT: !GetAtt AuroraCluster.Endpoint.Port
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref ECSTaskSG
+        SubnetIds:
+          - !Ref Subnet
+          - !Ref Subnet2
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Name
+          Value: budgetapp-prod-lambda-data-processor
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: BudgetAppUserPool
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_phone_number
+            Priority: 1
+          - Name: verified_email
+            Priority: 2
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      EmailVerificationMessage: The verification code to your new account is {####}
+      EmailVerificationSubject: Verify your new account
+      SmsVerificationMessage: The verification code to your new account is {####}
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+        EmailMessage: The verification code to your new account is {####}
+        EmailSubject: Verify your new account
+        SmsMessage: The verification code to your new account is {####}
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: budgetapp-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  DataAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: BudgetAppAPI
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+        AllowHeaders: ["Content-Type", "Authorization"]
+        MaxAge: 300
+
+  Deployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - DataAPIGetRoute
+      - DataAPIPostRoute
+    Properties:
+      Description: deployment
+      ApiId: !Ref DataAPI
+
+  CogAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      ApiId: !Ref DataAPI
+      AuthorizerType: JWT
+      IdentitySource: ["$request.header.Authorization"]
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClient]
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+
+  # Add API Stage
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref DataAPI
+      StageName: prod
+      AutoDeploy: true
+
+  DataAPIGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DataAPI
+      RouteKey: "GET /data"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CogAuthorizer
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  DataAPIPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref DataAPI
+      RouteKey: "POST /data"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CogAuthorizer
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref DataAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataProcessorLambda.Arn}/invocations"
+      PayloadFormatVersion: 1.0
+
+  LambdaAPIGWPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DataProcessorLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DataAPI}/*"
+
+Outputs:
+  VpcId:
+    Description: ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  PublicSubnetId:
+    Description: ID of the public subnet
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicSubnetId"
+
+  FrontendSubnetId:
+    Description: ID of the frontend subnet
+    Value: !Ref Subnet
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendSubnetId"
+
+  FrontendSubnet2Id:
+    Description: ID of the second frontend subnet
+    Value: !Ref Subnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendSubnet2Id"
+
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${DataAPI}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiEndpoint"
+
+  AuroraClusterEndpoint:
+    Description: Aurora Cluster Endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-AuroraEndpoint"
+
+  LoadBalancerDNS:
+    Description: DNS name of the load balancer
+    Value: !GetAtt Loadbalancer.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-LoadBalancerDNS"
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolId"
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolClientId"
